@@ -16,6 +16,8 @@ jobs:
       DATA_IMAGE_NAME: "${{ vars.RGCLONE_IMAGE_NAME }}"
       DATA_CONTAINER_NAME: "${{ vars.RGCLONE_CONTAINER_NAME }}-${{ github.run_number }}"
       PROXY_PORT: "${{ vars.RGCLONE_PROXY_PORT }}"
+      RGCLONE_API_ENDPOINT: ${{ vars.RGCLONE_API_ENDPOINT }}
+      RGCLONE_ACCESS_TOKEN: ${{ secrets.RGCLONE_ACCESS_TOKEN }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -23,7 +25,7 @@ jobs:
       - name: Install rgclone CLI
         id: installCLI
         env:
-          RGCLONE_API_ENDPOINT: ${{ secrets.RGCLONE_API_ENDPOINT }}
+          RGCLONE_API_ENDPOINT: ${{ vars.RGCLONE_API_ENDPOINT }}
           RGCLONE_ACCESS_TOKEN: ${{ secrets.RGCLONE_ACCESS_TOKEN }}
         run: |
           if command -v rgclone &> /dev/null; then
