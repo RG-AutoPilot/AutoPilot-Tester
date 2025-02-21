@@ -1,0 +1,126 @@
+name: Release-WorkFlow
+
+on:
+  workflow_dispatch:  # Manual trigger for full control
+  pull_request:
+    branches:
+      - release  # Runs validation when merging feature branches into release
+      - 'feature/*'  # Validates feature branches
+
+jobs:
+  setup-validation-environment:
+    if: github.repository_owner == 'RG-AutoPilot'
+    name: Spin Up RGClone Validation Container
+    runs-on: "self-hosted"
+    env:
+      DATA_IMAGE_NAME: "${{ vars.RGCLONE_IMAGE_NAME }}"
+      DATA_CONTAINER_NAME: "${{ vars.RGCLONE_CONTAINER_NAME }}-${{ github.run_number }}"
+      PROXY_PORT: "${{ vars.RGCLONE_PROXY_PORT }}"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install rgclone CLI
+        id: installCLI
+        env:
+          RGCLONE_API_ENDPOINT: ${{ secrets.RGCLONE_API_ENDPOINT }}
+          RGCLONE_ACCESS_TOKEN: ${{ secrets.RGCLONE_ACCESS_TOKEN }}
+        run: |
+          if command -v rgclone &> /dev/null; then
+            echo "rgclone already installed."
+            rgclone version
+            exit 0
+          fi
+          echo "Installing rgclone..."
+          INSTALL_DIR="/usr/local/bin"
+          TEMP_DIR=$(mktemp -d)
+          curl $RGCLONE_API_ENDPOINT/cloning-api/download/cli/linux-amd64 | tar xz -C "$TEMP_DIR"
+          sudo mv "$TEMP_DIR/rgclone" "$INSTALL_DIR/"
+          sudo chmod +x "$INSTALL_DIR/rgclone"
+          rgclone version
+
+      - name: Validate Data Image
+        id: createDataImage
+        run: |
+          output=$(rgclone get di "$DATA_IMAGE_NAME" --ignore-not-found -o json)
+          if [[ -z "$output" ]]; then
+              echo "Creating image..."
+              rgclone create data-image -f /home/flywayap/rgclone/yaml/AutoPilot_MSSQL-databases-from-script.yaml
+          else
+              echo "Image already exists."
+          fi
+
+      - name: Create Data Container
+        id: createDc
+        run: |
+          if ! rgclone get data-container "$DATA_CONTAINER_NAME" &> /dev/null ; then
+            echo "Creating container for $DATA_CONTAINER_NAME"
+            output=$(rgclone create dc -n "$DATA_CONTAINER_NAME" -i "$DATA_IMAGE_NAME" -t 20m -o json)
+          fi
+          dbUser=$(echo "$output" | jq -r '.user')
+          dbPassword=$(echo "$output" | jq -r '.password')
+          sqlhost=$(echo "$output" | jq -r '.host')
+          sqlport=$(echo "$output" | jq -r '.port')
+          instance="${sqlhost},${sqlport}"
+          echo "dbUser=$dbUser" >> "$GITHUB_ENV"
+          echo "dbPassword=$dbPassword" >> "$GITHUB_ENV"
+          echo "instance=$instance" >> "$GITHUB_ENV"
+
+  Validate-Flyway-Pipeline:
+    if: github.repository_owner == 'RG-AutoPilot'
+    name: Run Flyway Pipeline
+    needs: setup-validation-environment
+    uses: ./.github/workflows/GitHub-Flyway-CICD-Pipeline_Linux.yml
+    secrets: inherit
+
+  sync-to-Flyway-AutoPilot-FastTrack:
+    name: Sync Approved Files to CustomerRepo
+    runs-on: "self-hosted"
+    needs: Validate-Flyway-Pipeline
+    steps:
+      - name: Checkout DevRepo Release Branch
+        uses: actions/checkout@v4
+        with:
+          ref: release
+
+      - name: Clone CustomerRepo
+        run: |
+          git clone https://github.com/RG-AutoPilot/Flyway-AutoPilot-FastTrack.git Flyway-AutoPilot-FastTrack
+          cd Flyway-AutoPilot-FastTrack
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+      - name: Copy Approved Files
+        run: |
+          rsync -av --exclude='.github/workflows/ReleaseWorkflow.yml' --exclude='.github/workflows/GitHub-Workflow-Validation-Checks_RGCLONE.yml' AutoPilot-Tester/ Flyway-AutoPilot-FastTrack/
+
+      - name: Commit and Push to CustomerRepo
+        run: |
+          cd Flyway-AutoPilot-FastTrack
+          git checkout -b release-sync-${{ github.run_number }}
+          git add .
+          git commit -m "Syncing approved files from AutoPilot-Tester[release]"
+          git push origin release-sync-${{ github.run_number }}
+
+      - name: Create PR in CustomerRepo
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh pr create --repo RG-AutoPilot/Flyway-AutoPilot-FastTrack \
+            --base main \
+            --head release-sync-${{ github.run_number }} \
+            --title "Release Sync from AutoPilot-Tester" \
+            --body "Automated PR syncing approved files from AutoPilot-Tester[release]"
+
+  cleanup:
+    name: Clean-up Container
+    runs-on: "self-hosted"
+    needs: sync-to-Flyway-AutoPilot-FastTrack
+    if: always() && github.repository_owner == 'RG-AutoPilot'
+    steps:
+      - name: Clean-up Containers
+        run: |
+          if rgclone get data-container "$DATA_CONTAINER_NAME" &> /dev/null ; then
+            echo "Deleting container for $DATA_CONTAINER_NAME"
+            rgclone delete dc -n "$DATA_CONTAINER_NAME"
+          fi
